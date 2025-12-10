@@ -86,95 +86,132 @@ for row in result:
 
 
 def print_agent_event(event):
-    """Extract text and metadata from MAF agent events."""
-    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent
+    """Extract text and metadata from agent events."""
+    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent, UsageContent
     
-    event_type_str = type(event).__name__
     text_delta = None
+    function_call_info = None
     author_name = None
-    role = None
+    content_type = None
     
     # Handle AgentRunResponseUpdate streaming events
     if isinstance(event, AgentRunResponseUpdate):
         author_name = getattr(event, 'author_name', None)
-        role = getattr(event, 'role', None)
         
-        # Extract text from contents list (assume TextContent objects)
+        # Extract from contents list - check all content types
         contents = getattr(event, 'contents', None)
+        function_results = []  # Collect all function results
+        function_calls = []  # Collect all function calls
+        usage_detected = False
+        
         if contents:
             for content in contents:
                 if isinstance(content, TextContent):
                     text_delta = getattr(content, 'text', None)
                     if text_delta:
-                        break
+                        content_type = 'text'
+                elif isinstance(content, FunctionCallContent):
+                    # Extract function call information
+                    func_name = getattr(content, 'name', None) or ''
+                    func_args = getattr(content, 'arguments', None) or ''
+                    call_id = getattr(content, 'call_id', None) or ''
+                    # Always append even if name is empty (for streaming chunks)
+                    function_calls.append({'name': func_name, 'arguments': func_args, 'call_id': call_id})
+                    if not content_type:
+                        content_type = 'function_call'
                 elif isinstance(content, FunctionResultContent):
                     result = getattr(content, 'result', None)
+                    call_id = getattr(content, 'call_id', None)
                     if result:
-                        text_delta = f"[Function Result: {result}]"
-                        break
+                        function_results.append({'result': result, 'call_id': call_id})
+                        if not content_type:
+                            content_type = 'function_result'
+                elif isinstance(content, UsageContent):
+                    # UsageContent signals completion of LLM stream
+                    usage_detected = True
+                    content_type = 'usage'
+        
+        # Return usage signal if detected
+        if usage_detected:
+            return {
+                'text': None,
+                'author': author_name,
+                'function_call': None,
+                'function_calls': None,
+                'function_result': None,
+                'function_results': None,
+                'content_type': 'usage'
+            }
+        
+        # Return first function call if any
+        if function_calls:
+            return {
+                'text': None,
+                'author': author_name,
+                'function_call': function_calls[0],
+                'function_calls': function_calls,
+                'function_result': None,
+                'function_results': None,
+                'content_type': 'function_call'
+            }
+        
+        # Return all function results if any
+        if function_results:
+            return {
+                'text': None,
+                'author': author_name,
+                'function_call': None,
+                'function_calls': None,
+                'function_result': function_results[0],
+                'function_results': function_results,
+                'content_type': 'function_result'
+            }
         
         return {
-            'text': text_delta,
-            'author': author_name,
-            'role': role,
-            'event_type': event_type_str
+            'text': text_delta, 
+            'author': author_name, 
+            'function_call': function_call_info,
+            'function_calls': None,
+            'function_result': None,
+            'function_results': None,
+            'content_type': content_type
         }
     
-    # Handle events that have a 'data' object (like AgentRunUpdateEvent.data)
-    # The data object often contains the actual AgentRunResponseUpdate with contents
+    # Handle nested event.data structures
     if hasattr(event, 'data') and event.data:
         data = event.data
-        
-        # Get author_name from data
-        author_name = getattr(data, 'author_name', None)
-        role = getattr(data, 'role', None)
-        
-        # If data is AgentRunResponseUpdate, recursively call this function
         if isinstance(data, AgentRunResponseUpdate):
             return print_agent_event(data)
         
-        # Check if data has contents list (common structure)
+        author_name = getattr(data, 'author_name', None)
         if hasattr(data, 'contents') and data.contents:
-            contents = data.contents
-            for content in contents:
+            for content in data.contents:
                 if isinstance(content, TextContent):
-                    # Extract text from TextContent object
                     text_delta = getattr(content, 'text', None)
                     if text_delta:
+                        return {'text': text_delta, 'author': author_name, 'function_call': None, 'function_result': None, 'content_type': 'text'}
+                elif isinstance(content, FunctionCallContent):
+                    func_name = getattr(content, 'name', None)
+                    func_args = getattr(content, 'arguments', None)
+                    if func_name:
                         return {
-                            'text': text_delta,
-                            'author': author_name,
-                            'role': role,
-                            'event_type': event_type_str
+                            'text': None, 
+                            'author': author_name, 
+                            'function_call': {'name': func_name, 'arguments': func_args},
+                            'function_result': None,
+                            'content_type': 'function_call'
                         }
                 elif isinstance(content, FunctionResultContent):
                     result = getattr(content, 'result', None)
+                    call_id = getattr(content, 'call_id', None)
                     if result:
                         return {
-                            'text': f"[Function Result: {result}]",
+                            'text': None,
                             'author': author_name,
-                            'role': role,
-                            'event_type': event_type_str
+                            'function_call': None,
+                            'function_result': {'result': result, 'call_id': call_id},
+                            'content_type': 'function_result'
                         }
-        
-        # Try to get text directly from data
-        if hasattr(data, 'text'):
-            text_delta = data.text
-            if text_delta:
-                return {
-                    'text': text_delta,
-                    'author': author_name,
-                    'role': role,
-                    'event_type': event_type_str
-                }
-    
-    # For other event types, try to extract text
-    if hasattr(event, 'message'):
-        msg = event.message
-        if msg and hasattr(msg, 'text') and msg.text:
-            return {'text': msg.text, 'author': None, 'role': None, 'event_type': event_type_str}
-    elif hasattr(event, 'text') and event.text:
-        return {'text': event.text, 'author': None, 'role': None, 'event_type': event_type_str}
     
     return None
 
@@ -190,7 +227,8 @@ async def main() -> None:
         WorkflowStatusEvent,
     )
     from agent_framework.azure import AzureOpenAIChatClient, AzureOpenAIResponsesClient
-    from azure.identity import AzureCliCredential
+    from azure.identity import AzureCliCredential, ClientSecretCredential, DefaultAzureCredential
+    
     
     console = Console()
     
@@ -262,10 +300,16 @@ async def main() -> None:
     else:
         print(f"Using Azure AI Foundry agent ID: {data_analysis_agent_id}")
         # Use existing Azure AI Foundry agent
+        credential = ClientSecretCredential(
+            tenant_id=os.environ["AZURE_TENANT_ID"],
+            client_id=os.environ["AZURE_CLIENT_ID"],
+            client_secret=os.environ["AZURE_CLIENT_SECRET"],
+        )
+        credential=DefaultAzureCredential()
         data_analysis_agent = ChatAgent(
             chat_client=AzureAIAgentClient(
                 name="data_analysis_agent",
-                async_credential=AsyncAzureCliCredential(),
+                async_credential=credential,
                 agent_id=data_analysis_agent_id
             ),
             instructions="You are a data analysis specialist from Azure AI Foundry."
@@ -293,9 +337,14 @@ async def main() -> None:
         )
         .set_coordinator(orchestrator)
         .add_handoff(orchestrator, [database_agent, document_agent, data_analysis_agent])
+        .add_handoff(database_agent, orchestrator)
+        .add_handoff(document_agent, orchestrator)
+        .add_handoff(data_analysis_agent, orchestrator)
         .with_termination_condition(lambda conv: sum(1 for msg in conv if msg.role.value == "user") > 100)
+        .enable_return_to_previous(True)
         .build()
     )
+
 
     # Get initial user message from terminal
     rprint("\n[bold yellow]Enter your message (or 'quit' to exit):[/bold yellow]")

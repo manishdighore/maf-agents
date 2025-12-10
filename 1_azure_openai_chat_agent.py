@@ -20,7 +20,7 @@ load_dotenv()
 
 def print_agent_event(event):
     """Extract text and metadata from agent events."""
-    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent
+    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent, UsageContent
     
     text_delta = None
     function_call_info = None
@@ -35,6 +35,7 @@ def print_agent_event(event):
         contents = getattr(event, 'contents', None)
         function_results = []  # Collect all function results
         function_calls = []  # Collect all function calls
+        usage_detected = False
         
         if contents:
             for content in contents:
@@ -44,12 +45,13 @@ def print_agent_event(event):
                         content_type = 'text'
                 elif isinstance(content, FunctionCallContent):
                     # Extract function call information
-                    func_name = getattr(content, 'name', None)
-                    func_args = getattr(content, 'arguments', None)
-                    if func_name:
-                        function_calls.append({'name': func_name, 'arguments': func_args})
-                        if not content_type:
-                            content_type = 'function_call'
+                    func_name = getattr(content, 'name', None) or ''
+                    func_args = getattr(content, 'arguments', None) or ''
+                    call_id = getattr(content, 'call_id', None) or ''
+                    # Always append even if name is empty (for streaming chunks)
+                    function_calls.append({'name': func_name, 'arguments': func_args, 'call_id': call_id})
+                    if not content_type:
+                        content_type = 'function_call'
                 elif isinstance(content, FunctionResultContent):
                     result = getattr(content, 'result', None)
                     call_id = getattr(content, 'call_id', None)
@@ -57,6 +59,22 @@ def print_agent_event(event):
                         function_results.append({'result': result, 'call_id': call_id})
                         if not content_type:
                             content_type = 'function_result'
+                elif isinstance(content, UsageContent):
+                    # UsageContent signals completion of LLM stream
+                    usage_detected = True
+                    content_type = 'usage'
+        
+        # Return usage signal if detected
+        if usage_detected:
+            return {
+                'text': None,
+                'author': author_name,
+                'function_call': None,
+                'function_calls': None,
+                'function_result': None,
+                'function_results': None,
+                'content_type': 'usage'
+            }
         
         # Return first function call if any
         if function_calls:
@@ -209,6 +227,10 @@ async def main():
         accumulated_text = ""
         current_author = None
         
+        # Function call accumulation per call_id
+        function_call_accumulator = {}  # {call_id: {'name': str, 'arguments': str}}
+        last_call_id = None  # Track the last valid call_id for chunks with empty call_id
+        
         with Live("", console=console, refresh_per_second=10) as live:
             live.update("")  # Start with empty/hidden display
             async for event in agent.run_stream(user_input, thread=thread):
@@ -217,23 +239,54 @@ async def main():
                     if result['author']:
                         current_author = result['author']
                     
-                    # Handle function calls separately
+                    # Handle function calls - accumulate arguments across chunks
                     if result.get('content_type') == 'function_call' and result.get('function_call'):
                         func_info = result['function_call']
-                        func_name = func_info.get('name', 'unknown')
-                        func_args = func_info.get('arguments', {})
+                        func_name = func_info.get('name', '')
+                        func_args = func_info.get('arguments', '')
+                        call_id = func_info.get('call_id', '')
                         
-                        # Display function call in separate panel
-                        console.print(Panel(
-                            f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
-                            title=f"[bold magenta]🔧 Function Call - {current_author}[/bold magenta]",
-                            border_style="magenta",
-                            expand=False
-                        ))
+                        # Use last_call_id if current call_id is empty (subsequent chunks)
+                        if not call_id and last_call_id:
+                            call_id = last_call_id
+                        elif call_id:
+                            last_call_id = call_id
+                        else:
+                            call_id = 'default'
+                        
+                        # Initialize or update accumulator for this call_id
+                        if call_id not in function_call_accumulator:
+                            function_call_accumulator[call_id] = {'name': '', 'arguments': '', 'author': current_author}
+                        
+                        if func_name:
+                            function_call_accumulator[call_id]['name'] = func_name
+                        if func_args:
+                            function_call_accumulator[call_id]['arguments'] += str(func_args)
                     
-                    # Handle function results separately (may be multiple)
+                    # Handle usage content - signals LLM stream completion, display accumulated function calls
+                    elif result.get('content_type') == 'usage':
+                        # Display any accumulated function calls now that streaming is complete
+                        for call_id, call_data in function_call_accumulator.items():
+                            if call_data['name']:  # Only display if we have a name
+                                func_name = call_data['name']
+                                func_args = call_data['arguments']
+                                call_author = call_data.get('author', current_author)
+                                
+                                # Display function call in separate panel
+                                console.print(Panel(
+                                    f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
+                                    title=f"[bold magenta]🔧 Function Call - {call_author}[/bold magenta]",
+                                    border_style="magenta",
+                                    expand=False
+                                ))
+                        
+                        # Clear accumulator and reset call_id tracking after displaying
+                        function_call_accumulator.clear()
+                        last_call_id = None
+                    
+                    # Handle function results
                     elif result.get('content_type') == 'function_result' and result.get('function_results'):
-                        # Display each function result in a separate panel
+                        # Display function results (may be multiple)
                         for func_result_info in result['function_results']:
                             func_result = func_result_info.get('result', 'N/A')
                             call_id = func_result_info.get('call_id', 'unknown')
@@ -248,6 +301,8 @@ async def main():
                     
                     # Handle text content
                     elif result.get('text'):
+                        # Don't display function calls here - they will be displayed when we get usage content
+                        # Just accumulate the text
                         accumulated_text += result['text']
                         
                         # Update live panel with current author in title (only if there's text)

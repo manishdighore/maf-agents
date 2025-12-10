@@ -87,7 +87,7 @@ logging.basicConfig(filename='agent_events.log', level=logging.INFO)
 
 def print_agent_event(event):
     """Extract text and metadata from agent events."""
-    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent
+    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent, UsageContent
     
     text_delta = None
     function_call_info = None
@@ -102,8 +102,14 @@ def print_agent_event(event):
         
         # Extract from contents list - check all content types
         contents = getattr(event, 'contents', None)
+        
+        # Log individual content objects if there's only one
+        if contents and len(contents) == 1:
+            logging.info(f"  Content object vars: {vars(contents[0])}")
+        
         function_results = []  # Collect all function results
         function_calls = []  # Collect all function calls
+        usage_detected = False
         
         if contents:
             for content in contents:
@@ -113,12 +119,13 @@ def print_agent_event(event):
                         content_type = 'text'
                 elif isinstance(content, FunctionCallContent):
                     # Extract function call information
-                    func_name = getattr(content, 'name', None)
-                    func_args = getattr(content, 'arguments', None)
-                    if func_name:
-                        function_calls.append({'name': func_name, 'arguments': func_args})
-                        if not content_type:
-                            content_type = 'function_call'
+                    func_name = getattr(content, 'name', None) or ''
+                    func_args = getattr(content, 'arguments', None) or ''
+                    call_id = getattr(content, 'call_id', None) or ''
+                    # Always append even if name is empty (for streaming chunks)
+                    function_calls.append({'name': func_name, 'arguments': func_args, 'call_id': call_id})
+                    if not content_type:
+                        content_type = 'function_call'
                 elif isinstance(content, FunctionResultContent):
                     result = getattr(content, 'result', None)
                     call_id = getattr(content, 'call_id', None)
@@ -126,6 +133,22 @@ def print_agent_event(event):
                         function_results.append({'result': result, 'call_id': call_id})
                         if not content_type:
                             content_type = 'function_result'
+                elif isinstance(content, UsageContent):
+                    # UsageContent signals completion of LLM stream
+                    usage_detected = True
+                    content_type = 'usage'
+        
+        # Return usage signal if detected
+        if usage_detected:
+            return {
+                'text': None,
+                'author': author_name,
+                'function_call': None,
+                'function_calls': None,
+                'function_result': None,
+                'function_results': None,
+                'content_type': 'usage'
+            }
         
         # Return first function call if any
         if function_calls:
@@ -202,9 +225,10 @@ def print_agent_event(event):
 
 async def main():
     """Create a HandoffBuilder workflow and wrap it as an agent using .as_agent()"""
-    from agent_framework import HandoffBuilder
-    from agent_framework.azure import AzureOpenAIChatClient
-    from azure.identity import AzureCliCredential
+    from agent_framework import HandoffBuilder, ChatAgent
+    from agent_framework.azure import AzureOpenAIChatClient, AzureAIAgentClient
+    from azure.identity import AzureCliCredential, DefaultAzureCredential
+    from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential
     
     # Clear/reset logging for fresh run
     log_file = "swarm_agent.log"
@@ -245,6 +269,35 @@ async def main():
         tools=[search_documentation, get_code_examples],
     )
     
+    # Create Data Analysis Agent from Azure AI Foundry (or fallback)
+    print("\n--- Creating Data Analysis Agent ---")
+    data_analysis_agent_id = os.getenv("AGENT_ID")
+    
+    if not data_analysis_agent_id or data_analysis_agent_id == "your-agent-id-here":
+        print("⚠️  AGENT_ID not set in .env - creating placeholder agent")
+        # Fallback to regular agent if no Azure AI Foundry agent ID provided
+        data_analysis_agent = client.create_agent(
+            name="data_analysis_agent",
+            instructions=(
+                "You are a data analysis specialist. Analyze data patterns, generate insights, "
+                "create visualizations, and provide statistical analysis. Help with data interpretation."
+            ),
+            description="Handles data analysis and insights generation",
+        )
+    else:
+        print(f"✅ Using Azure AI Foundry agent ID: {data_analysis_agent_id}")
+        # Use existing Azure AI Foundry agent
+        data_analysis_agent = ChatAgent(
+            name="data_analysis_agent",
+            chat_client=AzureAIAgentClient(
+                model_deployment_name="gpt-4o",
+                name="data_analysis_agent",  # Add stable name here
+                async_credential=DefaultAzureCredential(),
+                agent_id=data_analysis_agent_id
+            ),
+            instructions="You are a data analysis specialist from Azure AI Foundry."
+        )
+    
     # Create orchestrator
     orchestrator = client.create_agent(
         name="orchestrator",
@@ -252,20 +305,25 @@ async def main():
             "You are an orchestrator agent. Analyze the user's request and route to the appropriate specialist:\n"
             "- For database queries, data retrieval, or SQL questions: call handoff_to_database_agent\n"
             "- For documentation, setup guides, API references, or code examples: call handoff_to_document_agent\n"
+            "- For data analysis, insights, patterns, statistics, or visualizations: call handoff_to_data_analysis_agent\n"
+            "Analyze the request carefully and delegate to the most appropriate specialist."
         ),
-        description="Routes requests to database or documentation specialists",
+        description="Routes requests to database, documentation, or data analysis specialists",
     )
     
     # Create HandoffBuilder workflow
     workflow = (
         HandoffBuilder(
-            name="data_docs_handoff",
-            participants=[orchestrator, database_agent, document_agent],
+            name="data_docs_analysis_handoff",
+            participants=[orchestrator, database_agent, document_agent, data_analysis_agent],
         )
         .set_coordinator(orchestrator)
-        .add_handoff(orchestrator, [database_agent, document_agent])
+        .add_handoff(orchestrator, [database_agent, document_agent, data_analysis_agent])
+        .add_handoff(database_agent, orchestrator)
+        .add_handoff(document_agent, orchestrator)
+        .add_handoff(data_analysis_agent, orchestrator)
         .with_termination_condition(lambda conv: sum(1 for msg in conv if msg.role.value == "user") > 100)
-        .build()
+        .enable_return_to_previous(True).build()
     )
     
     # Wrap workflow as agent using .as_agent()
@@ -289,9 +347,12 @@ async def main():
     rprint(Panel(user_input, border_style="yellow", expand=False))
     
     accumulated_text = ""
-    accumulated_function_calls = ""
     current_author = None
     previous_author = None
+    
+    # Function call accumulation per call_id
+    function_call_accumulator = {}  # {call_id: {'name': str, 'arguments': str}}
+    last_call_id = None  # Track the last valid call_id for chunks with empty call_id
     
     with Live("", console=console, refresh_per_second=10) as live:
         live.update("")  # Start with empty/hidden display
@@ -317,27 +378,57 @@ async def main():
                     current_author = result['author']
                     previous_author = result['author']
                 
-                # Handle function calls separately
+                # Handle function calls - accumulate arguments across chunks
                 if result.get('content_type') == 'function_call' and result.get('function_call'):
                     func_info = result['function_call']
-                    func_name = func_info.get('name', 'unknown')
-                    func_args = func_info.get('arguments', {})
+                    func_name = func_info.get('name', '')
+                    func_args = func_info.get('arguments', '')
+                    call_id = func_info.get('call_id', '')
                     
-                    # Log function call panel to file
-                    logging.info(f"[PANEL] Function Call - {current_author}: Calling {func_name} | Arguments: {func_args}")
+                    # Use last_call_id if current call_id is empty (subsequent chunks)
+                    if not call_id and last_call_id:
+                        call_id = last_call_id
+                    elif call_id:
+                        last_call_id = call_id
+                    else:
+                        call_id = 'default'
                     
-                    # Display function call in separate panel
-                    console.print(Panel(
-                        f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
-                        title=f"[bold magenta]🔧 Function Call - {current_author}[/bold magenta]",
-                        border_style="magenta",
-                        expand=False
-                    ))
-                    accumulated_function_calls += f"{func_name}, "
+                    # Initialize or update accumulator for this call_id
+                    if call_id not in function_call_accumulator:
+                        function_call_accumulator[call_id] = {'name': '', 'arguments': '', 'author': current_author}
+                    
+                    if func_name:
+                        function_call_accumulator[call_id]['name'] = func_name
+                    if func_args:
+                        function_call_accumulator[call_id]['arguments'] += str(func_args)
                 
-                # Handle function results separately (may be multiple)
+                # Handle usage content - signals LLM stream completion, display accumulated function calls
+                elif result.get('content_type') == 'usage':
+                    # Display any accumulated function calls now that streaming is complete
+                    for call_id, call_data in function_call_accumulator.items():
+                        if call_data['name']:  # Only display if we have a name
+                            func_name = call_data['name']
+                            func_args = call_data['arguments']
+                            call_author = call_data.get('author', current_author)
+                            
+                            # Log function call panel to file
+                            logging.info(f"[PANEL] Function Call - {call_author}: Calling {func_name} | Arguments: {func_args}")
+                            
+                            # Display function call in separate panel
+                            console.print(Panel(
+                                f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
+                                title=f"[bold magenta]🔧 Function Call - {call_author}[/bold magenta]",
+                                border_style="magenta",
+                                expand=False
+                            ))
+                    
+                    # Clear accumulator and reset call_id tracking after displaying
+                    function_call_accumulator.clear()
+                    last_call_id = None
+                
+                # Handle function results
                 elif result.get('content_type') == 'function_result' and result.get('function_results'):
-                    # Display each function result in a separate panel
+                    # Display function results (may be multiple)
                     for func_result_info in result['function_results']:
                         func_result = func_result_info.get('result', 'N/A')
                         call_id = func_result_info.get('call_id', 'unknown')
@@ -355,6 +446,8 @@ async def main():
                 
                 # Handle text content
                 elif result.get('text'):
+                    # Don't display function calls here - they will be displayed when we get function results
+                    # Just accumulate the text
                     accumulated_text += result['text']
                     
                     # Log text chunk to file
@@ -419,9 +512,12 @@ async def main():
             ))
         
         accumulated_text = ""
-        accumulated_function_calls = ""
         current_author = None
         previous_author = None
+        
+        # Function call accumulation per call_id
+        function_call_accumulator = {}  # {call_id: {'name': str, 'arguments': str}}
+        last_call_id = None  # Track the last valid call_id for chunks with empty call_id
         
         with Live("", console=console, refresh_per_second=10) as live:
             live.update("")  # Start with empty/hidden display
@@ -447,27 +543,57 @@ async def main():
                         current_author = result['author']
                         previous_author = result['author']
                     
-                    # Handle function calls separately
+                    # Handle function calls - accumulate arguments across chunks
                     if result.get('content_type') == 'function_call' and result.get('function_call'):
                         func_info = result['function_call']
-                        func_name = func_info.get('name', 'unknown')
-                        func_args = func_info.get('arguments', {})
+                        func_name = func_info.get('name', '')
+                        func_args = func_info.get('arguments', '')
+                        call_id = func_info.get('call_id', '')
                         
-                        # Log function call panel to file
-                        logging.info(f"[PANEL] Function Call - {current_author}: Calling {func_name} | Arguments: {func_args}")
+                        # Use last_call_id if current call_id is empty (subsequent chunks)
+                        if not call_id and last_call_id:
+                            call_id = last_call_id
+                        elif call_id:
+                            last_call_id = call_id
+                        else:
+                            call_id = 'default'
                         
-                        # Display function call in separate panel
-                        console.print(Panel(
-                            f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
-                            title=f"[bold magenta]🔧 Function Call - {current_author}[/bold magenta]",
-                            border_style="magenta",
-                            expand=False
-                        ))
-                        accumulated_function_calls += f"{func_name}, "
+                        # Initialize or update accumulator for this call_id
+                        if call_id not in function_call_accumulator:
+                            function_call_accumulator[call_id] = {'name': '', 'arguments': '', 'author': current_author}
+                        
+                        if func_name:
+                            function_call_accumulator[call_id]['name'] = func_name
+                        if func_args:
+                            function_call_accumulator[call_id]['arguments'] += str(func_args)
                     
-                    # Handle function results separately (may be multiple)
+                    # Handle usage content - signals LLM stream completion, display accumulated function calls
+                    elif result.get('content_type') == 'usage':
+                        # Display any accumulated function calls now that streaming is complete
+                        for call_id, call_data in function_call_accumulator.items():
+                            if call_data['name']:  # Only display if we have a name
+                                func_name = call_data['name']
+                                func_args = call_data['arguments']
+                                call_author = call_data.get('author', current_author)
+                                
+                                # Log function call panel to file
+                                logging.info(f"[PANEL] Function Call - {call_author}: Calling {func_name} | Arguments: {func_args}")
+                                
+                                # Display function call in separate panel
+                                console.print(Panel(
+                                    f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
+                                    title=f"[bold magenta]🔧 Function Call - {call_author}[/bold magenta]",
+                                    border_style="magenta",
+                                    expand=False
+                                ))
+                        
+                        # Clear accumulator and reset call_id tracking after displaying
+                        function_call_accumulator.clear()
+                        last_call_id = None
+                    
+                    # Handle function results
                     elif result.get('content_type') == 'function_result' and result.get('function_results'):
-                        # Display each function result in a separate panel
+                        # Display function results (may be multiple)
                         for func_result_info in result['function_results']:
                             func_result = func_result_info.get('result', 'N/A')
                             call_id = func_result_info.get('call_id', 'unknown')
@@ -485,6 +611,8 @@ async def main():
                     
                     # Handle text content
                     elif result.get('text'):
+                        # Don't display function calls here - they will be displayed when we get function results
+                        # Just accumulate the text
                         accumulated_text += result['text']
                         
                         # Log text chunk to file
