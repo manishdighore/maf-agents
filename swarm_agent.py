@@ -5,9 +5,10 @@ Reference: https://learn.microsoft.com/en-us/agent-framework/user-guide/workflow
 
 This takes the swarm workflow from 4_swarm.py and wraps it as a single agent.
 """
-
+from agent_framework import ChatMessageStore
 import asyncio
 import os
+import uuid
 from typing import Annotated
 from dotenv import load_dotenv
 from rich import print as rprint
@@ -20,6 +21,40 @@ import logging
 
 # Load environment variables
 load_dotenv()
+
+### MEMORY
+
+
+# from agent_framework.mem0 import Mem0Provider
+# from mem0 import CustomMemoryClient
+
+# client = CustomMemoryClient(
+#     base_url="http://localhost:8081"
+# )
+# # # Using Mem0 for advanced memory capabilities
+# memory_provider = Mem0Provider(
+#     mem0_client=client,
+#     api_key="test-api-key",
+#     user_id="user_123",
+#     application_id="my_app"
+# )
+
+from agent_framework.observability import setup_observability
+from langfuse import get_client, propagate_attributes
+
+# Generate a unique session ID for this conversation
+SESSION_ID = f"chat-session-{uuid.uuid4()}"
+USER_ID="madighore@ghaia.ai"
+# langfuse = get_client()
+ 
+# # Verify connection
+# if langfuse.auth_check():
+#     print("Langfuse client is authenticated and ready!")
+#     print(f"Session ID: {SESSION_ID}")
+# else:
+#     print("Authentication failed. Please check your credentials and host.")
+
+#setup_observability(enable_sensitive_data=True)
 
 
 # Database Tools (from 4_swarm.py)
@@ -87,9 +122,10 @@ logging.basicConfig(filename='agent_events.log', level=logging.INFO)
 
 def print_agent_event(event):
     """Extract text and metadata from agent events."""
-    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent, UsageContent
+    from agent_framework._types import TextContent, FunctionCallContent, FunctionResultContent, UsageContent, TextReasoningContent
     
     text_delta = None
+    reasoning_delta = None
     function_call_info = None
     author_name = None
     content_type = None
@@ -113,7 +149,16 @@ def print_agent_event(event):
         
         if contents:
             for content in contents:
-                if isinstance(content, TextContent):
+                if isinstance(content, TextReasoningContent):
+                    reasoning_delta = getattr(content, 'text', None)
+                    # Check raw_representation to see if this is a "done" event (complete summary)
+                    raw_rep = getattr(content, 'raw_representation', None)
+                    if raw_rep and hasattr(raw_rep, 'type') and raw_rep.type == 'response.reasoning_summary_text.done':
+                        # Skip the done event - we've already accumulated all the deltas
+                        continue
+                    if reasoning_delta:
+                        content_type = 'reasoning'
+                elif isinstance(content, TextContent):
                     text_delta = getattr(content, 'text', None)
                     if text_delta:
                         content_type = 'text'
@@ -137,6 +182,46 @@ def print_agent_event(event):
                     # UsageContent signals completion of LLM stream
                     usage_detected = True
                     content_type = 'usage'
+                    
+                    # Extract usage details from raw_representation - handle multiple structures
+                    usage_info = {}
+                    raw_rep = getattr(content, 'raw_representation', None)
+                    
+                    if raw_rep:
+                        usage = None
+                        
+                        # Try Azure OpenAI Response structure (raw_rep.response.usage)
+                        if hasattr(raw_rep, 'response') and hasattr(raw_rep.response, 'usage'):
+                            usage = raw_rep.response.usage
+                        # Try OpenAI ChatCompletion structure (raw_rep.usage)
+                        elif hasattr(raw_rep, 'usage'):
+                            usage = raw_rep.usage
+                        
+                        if usage:
+                            # Handle both input_tokens/output_tokens (Azure) and prompt_tokens/completion_tokens (OpenAI)
+                            input_tokens = getattr(usage, 'input_tokens', None) or getattr(usage, 'prompt_tokens', 0)
+                            output_tokens = getattr(usage, 'output_tokens', None) or getattr(usage, 'completion_tokens', 0)
+                            
+                            usage_info['input_tokens'] = input_tokens
+                            usage_info['output_tokens'] = output_tokens
+                            usage_info['total_tokens'] = getattr(usage, 'total_tokens', 0)
+                            
+                            # Extract reasoning tokens from various structures
+                            reasoning_tokens = 0
+                            # Try output_tokens_details (Azure)
+                            output_details = getattr(usage, 'output_tokens_details', None)
+                            if output_details:
+                                reasoning_tokens = getattr(output_details, 'reasoning_tokens', 0)
+                            # Try completion_tokens_details (OpenAI)
+                            completion_details = getattr(usage, 'completion_tokens_details', None)
+                            if completion_details and not reasoning_tokens:
+                                reasoning_tokens = getattr(completion_details, 'reasoning_tokens', 0)
+                            
+                            if reasoning_tokens:
+                                usage_info['reasoning_tokens'] = reasoning_tokens
+                            
+                            # Log extracted usage info
+                            logging.info(f"Extracted usage info: {usage_info}")
         
         # Return usage signal if detected
         if usage_detected:
@@ -147,7 +232,8 @@ def print_agent_event(event):
                 'function_calls': None,
                 'function_result': None,
                 'function_results': None,
-                'content_type': 'usage'
+                'content_type': 'usage',
+                'usage': usage_info if 'usage_info' in locals() else None
             }
         
         # Return first function call if any
@@ -175,7 +261,8 @@ def print_agent_event(event):
             }
         
         return {
-            'text': text_delta, 
+            'text': text_delta,
+            'reasoning': reasoning_delta,
             'author': author_name, 
             'function_call': function_call_info,
             'function_calls': None,
@@ -220,11 +307,22 @@ def print_agent_event(event):
                             'content_type': 'function_result'
                         }
     
+    # Log unhandled event structure before returning None
+    logging.warning(f"[print_agent_event] Returning None - unhandled event type: {type(event).__name__}")
     return None
 
 
 async def main():
     """Create a HandoffBuilder workflow and wrap it as an agent using .as_agent()"""
+    # Propagate session ID to all observations in this conversation
+    # with propagate_attributes(session_id=SESSION_ID, user_id=USER_ID):
+    #     await run_conversation()
+
+    await run_conversation()
+
+
+async def run_conversation():
+    """Run the main conversation loop with session tracking"""
     from agent_framework import HandoffBuilder, ChatAgent
     from agent_framework.azure import AzureOpenAIChatClient, AzureAIAgentClient
     from azure.identity import AzureCliCredential, DefaultAzureCredential
@@ -249,6 +347,7 @@ async def main():
     
     print("=" * 60)
     print("Swarm Workflow as Agent Demo")
+    print(f"Session ID: {SESSION_ID}")
     print("=" * 60)
     
     # Create client
@@ -309,6 +408,7 @@ async def main():
             "Analyze the request carefully and delegate to the most appropriate specialist."
         ),
         description="Routes requests to database, documentation, or data analysis specialists",
+        #context_providers=memory_provider
     )
     
     # Create HandoffBuilder workflow
@@ -344,11 +444,14 @@ async def main():
         return
     
     rprint("\n[bold yellow]User Message:[/bold yellow]")
-    rprint(Panel(user_input, border_style="yellow", expand=False))
+    rprint(Panel(user_input, border_style="yellow", expand=True))
     
     accumulated_text = ""
+    accumulated_reasoning = ""
     current_author = None
     previous_author = None
+    usage_tokens = None  # Store token usage information
+    reasoning_active = False  # Track if we're in reasoning phase
     
     # Function call accumulation per call_id
     function_call_accumulator = {}  # {call_id: {'name': str, 'arguments': str}}
@@ -358,25 +461,81 @@ async def main():
         live.update("")  # Start with empty/hidden display
         # Use run_stream on the workflow agent
         async for update in workflow_agent.run_stream(user_input, thread=workflow_thread):
+            # Log EVERY event received
+            logging.info(f"[EVENT RECEIVED] Type: {type(update).__name__}")
+            
             result = print_agent_event(update)
+            
+            # Log if event was not handled
+            if result is None:
+                logging.warning(f"[UNHANDLED EVENT] Event type {type(update).__name__} returned None from print_agent_event")
+                logging.warning(f"[UNHANDLED EVENT] Event details: {vars(update)}")
+            
             if result:
                 if result['author']:
                     # Check if author changed
                     if previous_author and result['author'] != previous_author:
                         # Finalize previous panel if there's accumulated text
                         if accumulated_text:
+                            # Build subtitle with token information if available
+                            subtitle = None
+                            if usage_tokens:
+                                subtitle_parts = []
+                                if usage_tokens.get('input_tokens') is not None:
+                                    subtitle_parts.append(f"In: {usage_tokens['input_tokens']}")
+                                if usage_tokens.get('output_tokens') is not None:
+                                    subtitle_parts.append(f"Out: {usage_tokens['output_tokens']}")
+                                if usage_tokens.get('reasoning_tokens') is not None:
+                                    subtitle_parts.append(f"Reasoning: {usage_tokens['reasoning_tokens']}")
+                                if usage_tokens.get('total_tokens') is not None:
+                                    subtitle_parts.append(f"Total: {usage_tokens['total_tokens']}")
+                                subtitle = " | ".join(subtitle_parts) if subtitle_parts else None
+                            
                             console.print(Panel(
                                 accumulated_text,
                                 title=f"[bold cyan]Response - {previous_author}[/bold cyan]",
+                                subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
                                 border_style="cyan",
-                                expand=False
+                                expand=True
                             ))
                             accumulated_text = ""
+                            usage_tokens = None  # Reset usage tokens for next author
                             # Hide live panel while it's empty
                             live.update("")
                     
                     current_author = result['author']
                     previous_author = result['author']
+                
+                # Handle reasoning content - stream it live
+                if result.get('content_type') == 'reasoning' and result.get('reasoning'):
+                    reasoning_active = True
+                    accumulated_reasoning += result['reasoning']
+                    
+                    # Update live panel with reasoning stream
+                    from rich.markdown import Markdown
+                    panel_title = f"[bold blue]🧠 Reasoning - {current_author}[/bold blue]" if current_author else "[bold blue]🧠 Reasoning[/bold blue]"
+                    live.update(Panel(
+                        Markdown(accumulated_reasoning),
+                        title=panel_title,
+                        border_style="blue",
+                        expand=True
+                    ))
+                    continue
+                
+                # Handle regular text - if we were in reasoning phase, finalize reasoning panel
+                if result.get('content_type') == 'text' and reasoning_active and accumulated_reasoning:
+                    # Print the completed reasoning panel (stop live update)
+                    from rich.markdown import Markdown
+                    logging.info(f"[PANEL] Reasoning Complete - {current_author}: {accumulated_reasoning[:100]}...")
+                    console.print(Panel(
+                        Markdown(accumulated_reasoning),
+                        title=f"[bold blue]🧠 Reasoning - {current_author}[/bold blue]",
+                        border_style="blue",
+                        expand=True
+                    ))
+                    reasoning_active = False
+                    accumulated_reasoning = ""
+                    # Continue to handle the text below
                 
                 # Handle function calls - accumulate arguments across chunks
                 if result.get('content_type') == 'function_call' and result.get('function_call'):
@@ -404,6 +563,10 @@ async def main():
                 
                 # Handle usage content - signals LLM stream completion, display accumulated function calls
                 elif result.get('content_type') == 'usage':
+                    # Capture usage information
+                    usage_tokens = result.get('usage')
+                    logging.info(f"Captured usage_tokens: {usage_tokens}")
+                    
                     # Display any accumulated function calls now that streaming is complete
                     for call_id, call_data in function_call_accumulator.items():
                         if call_data['name']:  # Only display if we have a name
@@ -419,7 +582,7 @@ async def main():
                                 f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
                                 title=f"[bold magenta]🔧 Function Call - {call_author}[/bold magenta]",
                                 border_style="magenta",
-                                expand=False
+                                expand=True
                             ))
                     
                     # Clear accumulator and reset call_id tracking after displaying
@@ -441,7 +604,7 @@ async def main():
                             f"{func_result}",
                             title=f"[bold green]✓ Function Result - {current_author}[/bold green]",
                             border_style="green",
-                            expand=False
+                            expand=True
                         ))
                 
                 # Handle text content
@@ -460,16 +623,33 @@ async def main():
                             accumulated_text,
                             title=panel_title,
                             border_style="cyan",
-                            expand=False
+                            expand=True
                         ))
     
-    # Print final accumulated text if any remains
+    # Print final accumulated text if any remains (with token usage if available)
     if accumulated_text and current_author:
+        panel_title = f"[bold cyan]Response - {current_author}[/bold cyan]"
+        
+        # Build subtitle with token information if available
+        subtitle = None
+        if usage_tokens:
+            subtitle_parts = []
+            if usage_tokens.get('input_tokens') is not None:
+                subtitle_parts.append(f"In: {usage_tokens['input_tokens']}")
+            if usage_tokens.get('output_tokens') is not None:
+                subtitle_parts.append(f"Out: {usage_tokens['output_tokens']}")
+            if usage_tokens.get('reasoning_tokens') is not None:
+                subtitle_parts.append(f"Reasoning: {usage_tokens['reasoning_tokens']}")
+            if usage_tokens.get('total_tokens') is not None:
+                subtitle_parts.append(f"Total: {usage_tokens['total_tokens']}")
+            subtitle = " | ".join(subtitle_parts) if subtitle_parts else None
+        
         console.print(Panel(
             accumulated_text,
-            title=f"[bold cyan]Response - {current_author}[/bold cyan]",
+            title=panel_title,
+            subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
             border_style="cyan",
-            expand=False
+            expand=True
         ))
     
     print()
@@ -485,7 +665,7 @@ async def main():
             break
         
         rprint("\n[bold yellow]User Message:[/bold yellow]")
-        rprint(Panel(user_response, border_style="yellow", expand=False))
+        rprint(Panel(user_response, border_style="yellow", expand=True))
         
         # Create function approval response messages for each pending request
         from agent_framework import ChatMessage, Role, FunctionApprovalResponseContent, FunctionCallContent
@@ -514,6 +694,7 @@ async def main():
         accumulated_text = ""
         current_author = None
         previous_author = None
+        usage_tokens = None  # Store token usage information
         
         # Function call accumulation per call_id
         function_call_accumulator = {}  # {call_id: {'name': str, 'arguments': str}}
@@ -530,13 +711,29 @@ async def main():
                         if previous_author and result['author'] != previous_author:
                             # Finalize previous panel if there's accumulated text
                             if accumulated_text:
+                                # Build subtitle with token information if available
+                                subtitle = None
+                                if usage_tokens:
+                                    subtitle_parts = []
+                                    if usage_tokens.get('input_tokens') is not None:
+                                        subtitle_parts.append(f"In: {usage_tokens['input_tokens']}")
+                                    if usage_tokens.get('output_tokens') is not None:
+                                        subtitle_parts.append(f"Out: {usage_tokens['output_tokens']}")
+                                    if usage_tokens.get('reasoning_tokens') is not None:
+                                        subtitle_parts.append(f"Reasoning: {usage_tokens['reasoning_tokens']}")
+                                    if usage_tokens.get('total_tokens') is not None:
+                                        subtitle_parts.append(f"Total: {usage_tokens['total_tokens']}")
+                                    subtitle = " | ".join(subtitle_parts) if subtitle_parts else None
+                                
                                 console.print(Panel(
                                     accumulated_text,
                                     title=f"[bold cyan]Response - {previous_author}[/bold cyan]",
+                                    subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
                                     border_style="cyan",
-                                    expand=False
+                                    expand=True
                                 ))
                                 accumulated_text = ""
+                                usage_tokens = None  # Reset usage tokens for next author
                                 # Hide live panel while it's empty
                                 live.update("")
                         
@@ -569,6 +766,10 @@ async def main():
                     
                     # Handle usage content - signals LLM stream completion, display accumulated function calls
                     elif result.get('content_type') == 'usage':
+                        # Capture usage information
+                        usage_tokens = result.get('usage')
+                        logging.info(f"Captured usage_tokens: {usage_tokens}")
+                        
                         # Display any accumulated function calls now that streaming is complete
                         for call_id, call_data in function_call_accumulator.items():
                             if call_data['name']:  # Only display if we have a name
@@ -584,12 +785,7 @@ async def main():
                                     f"[bold magenta]Calling:[/bold magenta] {func_name}\n[dim]Arguments: {func_args}[/dim]",
                                     title=f"[bold magenta]🔧 Function Call - {call_author}[/bold magenta]",
                                     border_style="magenta",
-                                    expand=False
-                                ))
-                        
-                        # Clear accumulator and reset call_id tracking after displaying
-                        function_call_accumulator.clear()
-                        last_call_id = None
+                                        expand=True))
                     
                     # Handle function results
                     elif result.get('content_type') == 'function_result' and result.get('function_results'):
@@ -606,7 +802,7 @@ async def main():
                                 f"{func_result}",
                                 title=f"[bold green]✓ Function Result - {current_author}[/bold green]",
                                 border_style="green",
-                                expand=False
+                                expand=True
                             ))
                     
                     # Handle text content
@@ -625,16 +821,33 @@ async def main():
                                 accumulated_text,
                                 title=panel_title,
                                 border_style="cyan",
-                                expand=False
+                                expand=True
                             ))
         
-        # Print final accumulated text if any remains
+        # Print final accumulated text if any remains (with token usage if available)
         if accumulated_text and current_author:
+            panel_title = f"[bold cyan]Response - {current_author}[/bold cyan]"
+            
+            # Build subtitle with token information if available
+            subtitle = None
+            if usage_tokens:
+                subtitle_parts = []
+                if usage_tokens.get('input_tokens') is not None:
+                    subtitle_parts.append(f"In: {usage_tokens['input_tokens']}")
+                if usage_tokens.get('output_tokens') is not None:
+                    subtitle_parts.append(f"Out: {usage_tokens['output_tokens']}")
+                if usage_tokens.get('reasoning_tokens') is not None:
+                    subtitle_parts.append(f"Reasoning: {usage_tokens['reasoning_tokens']}")
+                if usage_tokens.get('total_tokens') is not None:
+                    subtitle_parts.append(f"Total: {usage_tokens['total_tokens']}")
+                subtitle = " | ".join(subtitle_parts) if subtitle_parts else None
+            
             console.print(Panel(
                 accumulated_text,
-                title=f"[bold cyan]Response - {current_author}[/bold cyan]",
+                title=panel_title,
+                subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
                 border_style="cyan",
-                expand=False
+                expand=True
             ))
         
         print()
